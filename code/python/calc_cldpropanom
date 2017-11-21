@@ -1,0 +1,293 @@
+#!/usr/bin/env python2
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Oct 30 16:23:25 2017
+
+@author: cpatrizio
+"""
+
+#IMPORT STUFF:
+#=====================
+import cdms2 as cdms2
+import cdutil
+import MV2 as MV
+import numpy as np
+import glob
+import pylab as pl
+import matplotlib.pyplot as plt
+from mpl_toolkits.basemap import Basemap
+#import matplotlib.cmoloas cm
+
+#cdms2.axis.latitude_aliases.append("Y")
+#cdms2.axis.longitude_aliases.append("X")
+
+###########################################################################
+# HELPFUL FUNCTIONS FOLLOW 
+###########################################################################
+def global_average(data):
+    lats = data.getLatitude()[:]
+    weights = np.cos(np.deg2rad(lats))
+    zonal_ave = MV.average(data, axis=2)
+    global_ave = MV.average(zonal_ave, axis=1, weights=weights)
+    return global_ave
+    
+    
+
+
+
+###########################################################################
+def add_cyclic(data):
+    # Add Cyclic point around 360 degrees longitude:
+    lons=data.getLongitude()[:]
+    dx=np.gradient(lons)[-1]
+    data2 = data(longitude=(0, dx+np.max(lons)), squeeze=True)    
+    return data2
+
+###########################################################################
+def nanarray(vector):
+
+    # this generates a masked array with the size given by vector
+    # example: vector = (90,144,28)
+
+    # similar to this=NaN*ones(x,y,z) in matlab
+
+    this=MV.zeros(vector)
+    this=MV.masked_where(this==0,this)
+
+    return this
+
+###########################################################################
+def map_SWkern_to_lon(Ksw,albcsmap):
+
+    from scipy.interpolate import interp1d
+    ## Map each location's clear-sky surface albedo to the correct albedo bin
+    # Ksw is size 12,7,7,lats,3
+    # albcsmap is size A,lats,lons
+    albcs=np.arange(0.0,1.5,0.5) 
+    A=albcsmap.shape[0]
+    TT=Ksw.shape[1]
+    PP=Ksw.shape[2]
+    lenlat=Ksw.shape[3]
+    lenlon=albcsmap.shape[2]
+    SWkernel_map=nanarray((A,TT,PP,lenlat,lenlon))
+    for M in range(A):
+        MM=M
+        while MM>11:
+            MM=MM-12
+        for LA in range(lenlat):
+            alon=albcsmap[M,LA,:] 
+            # interp1d can't handle mask but it can deal with NaN (?)
+            try:
+                alon2=MV.where(alon.mask,np.nan,alon)   
+            except:
+                alon2=alon
+            if np.ma.count(alon2)>1: # at least 1 unmasked value
+                if len(pl.find(Ksw[MM,:,:,LA,:]>0))==0:
+                    SWkernel_map[M,:,:,LA,:] = 0
+                else:
+                    f = interp1d(albcs,Ksw[MM,:,:,LA,:],axis=2)
+                    ynew = f(alon2.data)
+                    ynew=MV.masked_where(alon2.mask,ynew)
+                    SWkernel_map[M,:,:,LA,:] = ynew
+            else:
+                continue
+
+    return SWkernel_map
+
+###########################################################################
+# MAIN ROUTINE FOLLOWS
+###########################################################################
+direc='/Users/cpatrizio/repos/cloud-radiative-kernels/data/'
+fin = '/Users/cpatrizio/data/CMIP5/'
+fout = '/Volumes/GoogleDrive/My Drive/PhD/CMIP5figs/'
+
+model_names =['MRI-CGCM3']
+
+print 'model:', model_names[0]
+
+if model_names[0] == 'MIROC5':
+    year1='21'
+    year2='22'
+else:
+    year1='18'
+    year2='19'
+
+# Load in the Zelinka et al 2012 kernels:
+f=cdms2.open(direc+'cloud_kernels2.nc')
+LWkernel=f('LWkernel')
+SWkernel=f('SWkernel')
+f.close()
+
+albcs=np.arange(0.0,1.5,0.5) # the clear-sky albedos over which the kernel is computed
+
+# LW kernel does not depend on albcs, just repeat the final dimension over longitudes:
+LWkernel_map=np.tile(np.tile(LWkernel[:,:,:,:,0],(1,1,1,1,1)),(144,1,1,1,1))(order=[1,2,3,4,0])
+
+# Define the cloud kernel axis attributes
+lats=LWkernel.getLatitude()[:]
+nlats = len(lats)
+lons=np.arange(1.25,360,2.5)
+nlons = len(lons)
+grid = cdms2.createGenericGrid(lats,lons)
+
+# Load in clisccp from two models
+#f=cdms2.open(direc+'clisccp_cfMon_MPI-ESM-LR_amip_r1i1p1_197901-198112.nc','r')
+f=cdms2.open(glob.glob(fin + model_names[0] + '/clisccp*_' + year1 + '*.nc')[0],'r')
+clisccp1=f('clisccp')
+t1i = clisccp1.getTime()[0]
+t2i = clisccp1.getTime()[-1]
+print 'clisccp1.shape', clisccp1.shape
+
+f.close()
+#f=cdms2.open(direc+'clisccp_cfMon_MPI-ESM-LR_amipFuture_r1i1p1_197901-198112.nc','r')
+f=cdms2.open(glob.glob(fin + model_names[0] + '/clisccp*_' + year2 + '*.nc')[0],'r')
+clisccp2=f('clisccp')
+t1f = clisccp2.getTime()[0]
+t2f = clisccp2.getTime()[-1]
+print 'clisccp2.shape', clisccp2.shape
+f.close()
+
+# Make sure clisccp is in percent  
+sumclisccp1=MV.sum(MV.sum(clisccp1,2),1)
+sumclisccp2=MV.sum(MV.sum(clisccp2,2),1)   
+if np.max(sumclisccp1) <= 1.:
+    clisccp1 = clisccp1*100.        
+if np.max(sumclisccp2) <= 1.:
+    clisccp2 = clisccp2*100.
+
+# Compute climatological annual cycle:
+avgclisccp1=cdutil.ANNUALCYCLE.climatology(clisccp1) #(12, TAU, CTP, LAT, LON)
+avgclisccp2=cdutil.ANNUALCYCLE.climatology(clisccp2) #(12, TAU, CTP, LAT, LON)
+del(clisccp1,clisccp2)
+
+# Compute clisccp anomalies
+anomclisccp = avgclisccp2 - avgclisccp1
+
+# Load surface air temperature
+#f=cdms2.open(direc+'tas_Amon_MPI-ESM-LR_amip_r1i1p1_197901-198112.nc','r')
+f=cdms2.open(glob.glob(fin + model_names[0] + '/tas*.nc')[0],'r')
+tas1 = f('tas', time=(t1i,t2i))
+print 'tas1.shape', tas1.shape
+#f.close()
+
+#f=cdms2.open(direc+'tas_Amon_MPI-ESM-LR_amipFuture_r1i1p1_197901-198112.nc','r')
+tas2 = f('tas', time=(t1f, t2f))
+print 'tas2.shape', tas2.shape
+f.close()
+
+# Compute climatological annual cycle:
+avgtas1=cdutil.ANNUALCYCLE.climatology(tas1) #(12, 90, 144)
+avgtas2=cdutil.ANNUALCYCLE.climatology(tas2) #(12, 90, 144)
+del(tas1,tas2)
+
+# Compute global annual mean tas anomalies
+anomtas = avgtas2 - avgtas1
+avgdtas = cdutil.averager(MV.average(anomtas,axis=0), axis='xy', weights='weighted') # (scalar)
+
+# Regrid everything to the kernel grid:
+avgclisccp1 = add_cyclic(avgclisccp1)
+avgclisccp2 = add_cyclic(avgclisccp2)
+avganomclisccp = add_cyclic(anomclisccp)
+avgclisccp1_grd = avgclisccp1.regrid(grid,regridTool="esmf",regridMethod = "linear")
+avgclisccp2_grd = avgclisccp2.regrid(grid,regridTool="esmf",regridMethod = "linear")
+avganomclisccp_grd = avganomclisccp.regrid(grid,regridTool="esmf",regridMethod = "linear")
+
+
+#Calculate total cloud amount and total cloud amount anomaly matrices (12, 90, 144)
+C_tot = MV.sum(MV.sum(avgclisccp1_grd, axis=2), axis=1)
+deltaC_tot = MV.sum(MV.sum(avganomclisccp_grd, axis=2), axis=1)
+
+taus = anomclisccp.getAxis(1)[:]
+CTPs = anomclisccp.getAxis(2)[:]
+
+lntaus = np.log(taus)
+
+lntauss, CTPss = np.meshgrid(lntaus, CTPs)
+
+deltalntau = nanarray((12, nlats, nlons))
+deltalntau.setGrid(grid)
+#deltalntau = MV.masked_equal(deltalntau,0)
+deltaCTP = nanarray((12, nlats, nlons))
+deltaCTP.setGrid(grid)
+#deltaCTP = MV.masked_equal(deltaCTP,0)
+
+print 'calculating cloud amount-weighted ln(tau) and CTP anomalies'
+for t in range(12):
+    print 'time = ', t
+    for i in range(nlats):
+        for j in range(nlons):
+            avgclisccp1_hist = avgclisccp1_grd[t,:,:,i,j]
+            norm1 = avgclisccp1_hist/np.sum(avgclisccp1_hist)
+            avgclisccp2_hist = avgclisccp2_grd[t,:,:,i,j]
+            norm2 = avgclisccp2_hist/np.sum(avgclisccp2_hist)
+            hist1, lntau_edges, CTP_edges = np.histogram2d(lntauss.flatten(), CTPss.flatten(), bins=[taus, CTPs[::-1]], weights=norm1.flatten())
+            hist2, lntau_edges, CTP_edges = np.histogram2d(lntauss.flatten(), CTPss.flatten(), bins=[taus, CTPs[::-1]], weights=norm2.flatten())
+            lntau_mids = (lntau_edges[1:] + lntau_edges[:-1])/2.
+            CTP_mids = (CTP_edges[1:] + CTP_edges[:-1])/2.
+            lntau_midss, CTP_midss = np.meshgrid(lntau_mids, CTP_mids)
+            meantau1 = np.sum(hist1*lntau_midss)
+            meanCTP1 = np.sum(hist1*CTP_midss)
+            meantau2 = np.sum(hist2*lntau_midss)
+            meanCTP2 = np.sum(hist2*CTP_midss)
+            deltalntau[t, i, j] = meantau1 - meantau2
+            deltaCTP[t, i, j] = meanCTP1 - meanCTP2
+            
+#deltalntau = MV.masked_equal(deltalntau,np.nan)
+#deltaCTP = MV.masked_equal(deltaCTP,np.nan)
+
+print 'global mean cloud fraction anomaly (cdutil: % per K):', cdutil.averager(MV.average(deltaC_tot/avgdtas, axis=0), axis='xy', weights='weighted')
+print 'global mean cloud fraction anomaly (function: % per K):', MV.average(global_average(deltaC_tot/avgdtas))
+#GLOBAL AVERAGING NOT WORKING: cdutil.averager gives error for deltalntau and deltaCTP... it seems that setGrid() doesn't work as expected. 
+#Try regridding? Function for dealing with np arrays?
+print 'global mean ln(tau) anomaly (function: per K):', MV.average(global_average(deltalntau))/avgdtas
+print 'global mean CTP anomaly (functino: hPa per K):', MV.average(global_average(deltaCTP))/(100*avgdtas)
+
+par = np.arange(-90.,91.,30.)
+mer = np.arange(-180.,181.,60.)
+
+cldanom_max = 8
+deltaCTP_max = 25
+deltalntau_max = 4
+
+cldlevels = np.linspace(-cldanom_max, cldanom_max, 4*cldanom_max+1)
+deltaCTPlevels = np.linspace(-deltaCTP_max, deltaCTP_max, 4*deltaCTP_max+1)
+deltalntaulevels = np.linspace(-deltalntau_max, deltalntau_max, 41)
+
+fig = plt.figure(figsize=(10,8))
+ax = fig.add_subplot(311)
+#plt.subplots()
+m = Basemap(projection='moll',lon_0=180,resolution='i')
+m.drawcoastlines(linewidth=0.1)
+m.drawparallels(par, dashes=[1,0], labels=[1,0,0,1], linewidth=0.1)
+m.drawmeridians(mer, dashes=[1,0], linewidth=0.1)
+x, y = m(*np.meshgrid(lons, lats))
+m.contourf(x, y, MV.average(deltaC_tot/avgdtas, axis=0), cmap=plt.cm.RdBu_r, levels=cldlevels, extend='both')
+m.colorbar(label=r'% K$^{{-1}}$', format='%3.1f')
+ax.set_title(r'$\Delta C_{{tot}}$')
+
+
+ax = fig.add_subplot(312)
+#plt.subplots()
+m = Basemap(projection='moll',lon_0=180,resolution='i')
+m.drawcoastlines(linewidth=0.1)
+m.drawparallels(par, dashes=[1,0], labels=[1,0,0,1], linewidth=0.1)
+m.drawmeridians(mer, dashes=[1,0], linewidth=0.1)
+x, y = m(*np.meshgrid(lons, lats))
+m.contourf(x, y, MV.average(deltaCTP/avgdtas, axis=0)/100., cmap=plt.cm.RdBu_r, levels=deltaCTPlevels, extend='both')
+m.colorbar(label=r'hPa K$^{{-1}}$', format='%3.1f')
+ax.set_title(r'$\Delta$CTP')
+
+
+ax = fig.add_subplot(313)
+#plt.subplots()
+m = Basemap(projection='moll',lon_0=180,resolution='i')
+m.drawcoastlines(linewidth=0.1)
+m.drawparallels(par, dashes=[1,0], labels=[1,0,0,1], linewidth=0.1)
+m.drawmeridians(mer, dashes=[1,0], linewidth=0.1)
+x, y = m(*np.meshgrid(lons, lats))
+m.contourf(x, y, MV.average(deltalntau/avgdtas, axis=0), cmap=plt.cm.RdBu_r, levels=deltalntaulevels, extend='both')
+m.colorbar(label=r' K$^{{-1}}$', format='%3.1f')
+ax.set_title(r'$\Delta$ln$(\tau)$')
+plt.suptitle(model_names[0])
+plt.savefig(fout + 'cldpropanom_map_' + model_names[0] + '_abrupt4xCO2.pdf')
+plt.close()            
